@@ -1,0 +1,158 @@
+# TenantOS VLAN Automation .gitignore
+
+# ================================================================
+# SENSITIVE CONFIGURATION - NEVER COMMIT
+# ================================================================
+
+# Configuration file with API tokens
+app/Custom/EventListeners/vlan_automation_config.php
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# ================================================================
+# LOG FILES
+# ================================================================
+
+# Application logs
+*.log
+storage/logs/
+
+# ================================================================
+# IDE / EDITOR FILES
+# ================================================================
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains (PhpStorm, IntelliJ, etc)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Atom
+.atom/
+
+# ================================================================
+# OPERATING SYSTEM FILES
+# ================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+
+# ================================================================
+# COMPOSER (if using PHP dependencies)
+# ================================================================
+
+vendor/
+composer.lock
+
+# ================================================================
+# TEMPORARY / BACKUP FILES
+# ================================================================
+
+*.bak
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+*.orig
+
+# ================================================================
+# OS-SPECIFIC
+# ================================================================
+
+# Windows shortcuts
+*.lnk
+
+# ================================================================
+# DEVELOPMENT / TESTING
+# ================================================================
+
+# Test coverage
+coverage/
+.coverage
+.phpunit.result.cache
+
+# Local testing files
+test-*.php
+local-test-*.php
+
+# ================================================================
+# CREDENTIALS - MULTIPLE PATTERNS
+# ================================================================
+
+# Any file with "token", "secret", "password" in name
+*token*
+*secret*
+*password*
+*credentials*
+
+# Private keys
+*.pem
+*.key
+*.ppk
+
+# ================================================================
+# DOCUMENTATION BUILD
+# ================================================================
+
+# Build artifacts (if generating docs)
+_build/
+dist/
+
+# ================================================================
+# NODE / NPM (if applicable)
+# ================================================================
+
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json (if not committing dependencies)
+
+# ================================================================
+# CUSTOM SENSITIVE PATTERNS
+# ================================================================
+
+# Real configuration examples (keep example template)
+vlan_automation_config.REAL.php
+vlan_automation_config.PROD.php
+vlan_automation_config.*.php
+!vlan_automation_config.example.php
+
+# API tokens in any form
+*api-token*
+*api_token*
+*apikey*
+*api-key*
