@@ -5,7 +5,8 @@
 # ================================================================
 
 # Configuration file with API tokens
-app/Custom/EventListeners/vlan_automation_config.php
+vlan_automation_config.php
+tnsr-vlan-restconf.php
 
 # Environment variables
 .env
