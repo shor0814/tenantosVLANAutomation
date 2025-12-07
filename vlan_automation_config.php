@@ -159,9 +159,9 @@ return [
     //   {SERVER_ID}             - Server identifier
     //   {VLAN_ID}               - VLAN number
     //   {MLAG_ID}               - MLAG domain ID (usually same as CHANNEL_GROUP)
-    //   {IPV6_ADDRESS}          - Server host IPv6 address (e.g., 2602:f937:0:bb00::2)
-    //   {IPV6_ROUTED_SUBNET}    - Routed subnet from TenantOS (e.g., 2602:f937:0:b00::/56)
-    //   {IPV6_HOST_SUBNET}      - Calculated host subnet (e.g., 2602:f937:0:bb00::/64)
+    //   {IPV6_ADDRESS}          - Server host IPv6 address (e.g., XXXX:YYYY:0:bb00::2)
+    //   {IPV6_ROUTED_SUBNET}    - Routed subnet from TenantOS (e.g., XXXX:YYYY:0:b00::/56)
+    //   {IPV6_HOST_SUBNET}      - Calculated host subnet (e.g., XXXX:YYYY:0:bb00::/64)
     //   {DATE}                  - Current date
     //
     // ================================================================
