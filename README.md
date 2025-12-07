@@ -44,7 +44,7 @@ Identify MLAG pair from valid_pairs config
     ↓
 Retrieve VLAN assigned to server
     ↓
-Calculate IPv6 gateway (2602:f937:0:b00::/56 → 2602:f937:0:bb00::1)
+Calculate IPv6 gateway (XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::1)
     ↓
 Determine PRIMARY/SECONDARY based on VLAN parity
     ↓
@@ -252,7 +252,7 @@ In TenantOS → IP Manager:
 2. For each switch pair, create separate child subnet:
 
 **For Arista 7280 pair (Switches 19, 11):**
-   - Subnet: `2602:f937:0:b00::/56`
+   - Subnet: `XXXX:YYYY:0:b00::/56`
    - VLAN Automation: Enable
    - VLAN Type: Native + Trunk
    - Native VLAN ID: Create New VLAN (auto-increment, range 150-199)
@@ -261,7 +261,7 @@ In TenantOS → IP Manager:
    - Only offer if server has one of these tags (optional) - Apply "7280" tag (restricts which servers see this subnet)
 
 **For Arista 7050 pair (Switches 25, 23):**
-   - Subnet: `2602:f937:0:c00::/56`
+   - Subnet: `XXXX:YYYY:0:c00::/56`
    - VLAN Automation: Enable
    - VLAN Type: Native + Trunk
    - Native VLAN ID: Create New VLAN (auto-increment, range 150-199)
@@ -345,8 +345,8 @@ Templates are free-form and fully customizable. Both switches receive identical 
 {PORT_CHANNEL_CONFIG_REMOVAL}  Port-Channel removal block (removal template)
 {IPV4_ADDRESS}                 IPv4 address (if configured)
 {IPV6_ADDRESS}                 IPv6 server address
-{IPV6_ROUTED_SUBNET}           Routed subnet (2602:f937:0:b00::/56)
-{IPV6_HOST_SUBNET}             Host subnet (2602:f937:0:bb00::/64)
+{IPV6_ROUTED_SUBNET}           Routed subnet (XXXX:YYYY:0:b00::/56)
+{IPV6_HOST_SUBNET}             Host subnet (XXXX:YYYY:0:bb00::/64)
 ```
 
 ### Template Example (Arista)
@@ -375,7 +375,7 @@ php your-tool.php delete <subnet> <vlan>    # Returns 0 on success
 
 **Arguments:**
 - Action: `create` or `delete`
-- Subnet: IPv6 subnet string (e.g., `2602:f937:0:b00::/56`)
+- Subnet: IPv6 subnet string (e.g., `XXXX:YYYY:0:b00::/56`)
 - VLAN: Integer (e.g., `101`)
 
 **Return codes:**
@@ -444,9 +444,9 @@ If either is missing, configuration fails.
 
 ⚠️ **Gateway Calculation** - Assumes subnets follow pattern:
 ```
-Routed:  2602:f937:0:b00::/56   → extracted: 2602:f937:0:b
-Host:    2602:f937:0:bb00::/64  → incremented: b → bb
-Gateway: 2602:f937:0:bb00::1
+Routed:  XXXX:YYYY:0:b00::/56   → extracted: XXXX:YYYY:0:b
+Host:    XXXX:YYYY:0:bb00::/64  → incremented: b → bb
+Gateway: XXXX:YYYY:0:bb00::1
 ```
 If your subnets use different pattern, customize gateway calculation in listener.  *Potential Ehanncement to include in config file
 
@@ -506,7 +506,7 @@ If your subnets use different pattern, customize gateway calculation in listener
 
 2. **Test script manually:**
    ```bash
-   php app/Custom/EventListeners/tnsr-vlan-restconf.php create 2602:f937:0:b00::/56 101
+   php app/Custom/EventListeners/tnsr-vlan-restconf.php create XXXX:YYYY:0:b00::/56 101
    echo $?  # Should be 0
    ```
 
