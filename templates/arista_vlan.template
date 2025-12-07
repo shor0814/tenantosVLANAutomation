@@ -1,0 +1,75 @@
+! ================================================================
+! VLAN Configuration Template - Arista EOS
+! ================================================================
+! Server {SERVER_ID} - VLAN {VLAN_ID}
+! Generated: {DATE}
+!
+! Placeholders (will be replaced automatically when placed in {} such as {PLACEHOLDER_NAME}):
+! VLAN_ID               - VLAN number
+! SERVER_ID             - Server identifier
+! PORT_NAME             - Physical port (e.g., Ethernet39, Et20/1)
+! PORT_NUMBER           - Physical port number(e.g., 39, 201)
+! IPV4_ADDRESS          - Server's IPv4 address
+! IPV6_ADDRESS          - Server's IPv6 address (:2 from host subnet)
+! IPV6_ROUTED_SUBNET    - Routed subnet from TenantOS (e.g., XXXX:YYYY:0:b00::/56)
+! IPV6_HOST_SUBNET      - Calculated host subnet (e.g., XXXX:YYYY:0:bb00::/64)
+! LACP_CONFIG           - LACP config (filled from LACP_CONFIG_BLOCK)
+! PORT_CHANNEL_CONFIG   - Port-Channel interface config
+! CHANNEL_GROUP         - Port channel number
+! MLAG_ID               - MLAG domain ID
+! DATE                  - Current date/time
+! ================================================================
+
+!
+! ================================================================
+! VLAN Definition
+! ================================================================
+!
+! Create VLAN
+vlan {VLAN_ID}
+   name vlan.{VLAN_ID}
+   !! {SERVER_ID} VLAN {VLAN_ID} - {DATE}
+
+! Configure Interface
+! Port description includes VLAN for future removal tracking
+interface ethernet{PORT_STRING}
+   description Server {SERVER_ID} - VLAN {VLAN_ID} - {DATE}
+   switchport mode trunk
+   switchport trunk allowed vlan add {VLAN_ID}
+   no switchport trunk native vlan
+   ip access-group ACL_SERVER_{SERVER_ID}_IN in
+!   ipv6 access-group ACL_SERVER_{SERVER_ID}_V6_IN in
+   spanning-tree portfast edge
+   no shutdown
+   
+! LACP/Port-Channel Configuration (if MLAG enabled)
+! This section will be populated with channel-group and lacp commands
+! or will be empty if MLAG is disabled
+   {LACP_CONFIG}
+
+! Port-Channel MLAG Configuration (if MLAG enabled)
+{PORT_CHANNEL_CONFIG}
+
+! ACL for IPv4 Traffic - Server {SERVER_ID}
+! Permits traffic from server's IPv4 address, denies all else
+ip access-list ACL_SERVER_{SERVER_ID}_IN
+   10 permit ip host {IPV4_ADDRESS} any
+   1000 deny ip any any
+
+! ACL for IPv6 Traffic - Server {SERVER_ID}
+! Permits traffic from server's IPv6 /64 address and full subnet
+ipv6 access-list ACL_SERVER_{SERVER_ID}_V6_IN
+   10 permit ipv6 host {IPV6_ADDRESS} any
+   20 permit ipv6 {IPV6_HOST_SUBNET} any
+   30 permit ipv6 {IPV6_ROUTED_SUBNET} any
+   1000 deny ipv6 any any
+
+! ============================================================================
+! MLAG Configuration Reference
+! Note: MLAG domain and peer configuration should already be set up
+! This automation only configures the port-channel membership and priority
+! ============================================================================
+! MLAG Domain: {MLAG_DOMAIN}
+! MLAG Priority: {MLAG_PRIORITY}
+! ============================================================================
+

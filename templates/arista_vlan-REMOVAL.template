@@ -1,0 +1,68 @@
+! ================================================================
+! VLAN Removal Template - Arista EOS
+! ================================================================
+! Server {SERVER_ID} - VLAN {VLAN_ID}
+! Generated: {DATE}
+!
+! This template removes VLAN configuration and access lists
+! Executed BEFORE the subnet/VLAN are removed from database
+!
+! Placeholders (will be replaced automatically when placed in {} such as {PLACEHOLDER_NAME}):
+! Placeholders (will be replaced automatically when placed in {} such as {PLACEHOLDER_NAME}):
+! VLAN_ID               - VLAN number
+! SERVER_ID             - Server identifier
+! PORT_NAME             - Physical port (e.g., Ethernet39, Et20/1)
+! PORT_NUMBER           - Physical port number(e.g., 39, 201)
+! IPV4_ADDRESS          - Server's IPv4 address
+! IPV6_ADDRESS          - Server's IPv6 address (:2 from host subnet)
+! IPV6_ROUTED_SUBNET    - Routed subnet from TenantOS (e.g., XXXX:YYYY:0:b00::/56)
+! IPV6_HOST_SUBNET      - Calculated host subnet (e.g., XXXX:YYYY:0:bb00::/64)
+! LACP_CONFIG           - LACP config (filled from LACP_CONFIG_BLOCK)
+! PORT_CHANNEL_CONFIG   - Port-Channel interface config
+! CHANNEL_GROUP         - Port channel number
+! MLAG_ID               - MLAG domain ID
+! DATE                  - Current date/time
+! ================================================================
+
+!
+! ================================================================
+! Remove VLAN and ACL from Port
+! ================================================================
+!
+interface ethernet{PORT_STRING}
+   description Server {SERVER_ID}
+   no switchport trunk allowed vlan {VLAN_ID}
+   switchport trunk allowed vlan 1
+   switchport mode trunk
+   no ip access-group ACL_SERVER_{SERVER_ID}_IN in
+!   no ipv6 access-group ACL_SERVER_{SERVER_ID}_V6_IN in
+   spanning-tree portfast edge
+! LACP/Port-Channel Configuration (if MLAG enabled)
+! This section will be populated with channel-group and lacp commands
+! or will be empty if MLAG is disabled
+   {LACP_CONFIG_REMOVAL}
+!
+! ================================================================
+! Remove IPv4 ACL
+! ================================================================
+!
+no ip access-list ACL_SERVER_{SERVER_ID}_IN
+!
+
+!
+! ================================================================
+! Remove IPv6 ACL
+! ================================================================
+!
+no ipv6 access-list ACL_SERVER_{SERVER_ID}_V6_IN
+!
+
+!
+! ================================================================
+! Remove VLAN Definition
+! ================================================================
+!
+no vlan {VLAN_ID}
+!
+
+{PORT_CHANNEL_CONFIG_REMOVAL}
