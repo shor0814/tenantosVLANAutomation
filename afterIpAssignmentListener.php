@@ -11,11 +11,11 @@ use Illuminate\Support\Facades\Http;
  * UPDATED VLAN Automation Listener - Single Routed Subnet with Calculated Host Subnet
  * 
  * SUBNET STRUCTURE (per TNSR pattern):
- * Input from TenantOS: 2602:f937:0:b00::/56 (routed subnet)
+ * Input from TenantOS: XXXX:YYYY:0:b00::/56 (routed subnet)
  * TNSR calculates:
- *   - Host subnet: 2602:f937:0:bb00::/64 (insert 'b' before third hextet)
- *   - Gateway: 2602:f937:0:bb00::1/64 (first IP of host subnet)
- *   - Host address: 2602:f937:0:bb00::2 (second IP of host subnet)
+ *   - Host subnet: XXXX:YYYY:0:bb00::/64 (insert 'b' before third hextet)
+ *   - Gateway: XXXX:YYYY:0:bb00::1/64 (first IP of host subnet)
+ *   - Host address: XXXX:YYYY:0:bb00::2 (second IP of host subnet)
  * 
  * Template variables:
  *   {IPV6_ADDRESS}       - Host address (::2)
@@ -1245,7 +1245,7 @@ class afterIpAssignmentListener {
 
     /**
      * UPDATED: Calculate IPv6 :2 address (server-side)
-     * Example: 2602:f937:0:b00::/56 → 2602:f937:0:b00::2
+     * Example: XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:b00::2
      * Previously calculated ::1 (gateway)
      */
     private function calculateIpv6ServerAddress($subnet) {
@@ -1281,7 +1281,7 @@ class afterIpAssignmentListener {
 
     /**
      * Get routed subnet from database and calculate host subnet and address
-     * The TNSR script converts: 2602:f937:0:b00::/56 → 2602:f937:0:bb00::
+     * The TNSR script converts: XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::
      * Returns array with calculated values for template
      */
     private function getServerSubnets($serverId) {
@@ -1297,7 +1297,7 @@ class afterIpAssignmentListener {
             }
             
             // Calculate the host subnet using TNSR pattern
-            // 2602:f937:0:b00::/56 → 2602:f937:0:bb00::/64
+            // XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::/64
             $hostSubnet = $this->calculateHostSubnet($routedSubnet);
             
             return [
@@ -1312,13 +1312,13 @@ class afterIpAssignmentListener {
     /**
      * Calculate host subnet following TNSR pattern
      * Takes third hextet and inserts 'b' before it
-     * 2602:f937:0:b00::/56 → 2602:f937:0:bb00::/64
+     * XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::/64
      */
     private function calculateHostSubnet($routedSubnet) {
         try {
-            // Match pattern: 2602:f937:0:XYZ::/56
+            // Match pattern: XXXX:YYYY:0:XYZ::/56
             if (preg_match('/^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:)([0-9a-f]+)(::\/56)$/i', $routedSubnet, $matches)) {
-                $prefix = $matches[1];     // 2602:f937:0:
+                $prefix = $matches[1];     // XXXX:YYYY:0:
                 $hextet = $matches[2];     // b00
                 
                 // Insert 'b' before the hextet: b00 → bb00
@@ -1336,7 +1336,7 @@ class afterIpAssignmentListener {
 
     /**
      * Calculate host IP address from host subnet
-     * 2602:f937:0:bb00::/64 → 2602:f937:0:bb00::2
+     * XXXX:YYYY:0:bb00::/64 → XXXX:YYYY:0:bb00::2
      */
     private function calculateHostAddress($hostSubnet) {
         try {
@@ -1432,9 +1432,9 @@ class afterIpAssignmentListener {
     private function calculateGateway($subnet, $vlan) {
         try {
             // Calculate gateway using same TNSR pattern as host subnet
-            // 2602:f937:0:b00::/56 → 2602:f937:0:bb00::1/64
+            // XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::1/64
             if (preg_match('/^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:)([0-9a-f]+)(::\/56)$/i', $subnet, $matches)) {
-                $prefix = $matches[1];     // 2602:f937:0:
+                $prefix = $matches[1];     // XXXX:YYYY:0:
                 $hextet = $matches[2];     // b00
                 
                 // Insert 'b' before the hextet: b00 → bb00
