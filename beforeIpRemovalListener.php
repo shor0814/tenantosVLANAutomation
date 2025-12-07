@@ -795,12 +795,12 @@ class beforeIpRemovalListener {
 
     /**
      * Calculate gateway using TNSR pattern
-     * 2602:f937:0:b00::/56 → 2602:f937:0:bb00::1/64
+     * XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::1/64
      */
     private function calculateGateway($subnet, $vlan) {
         try {
             if (preg_match('/^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:)([0-9a-f]+)(::\/56)$/i', $subnet, $matches)) {
-                $prefix = $matches[1];     // 2602:f937:0:
+                $prefix = $matches[1];     // XXXX:YYYY:0:
                 $hextet = $matches[2];     // b00
                 
                 // Insert 'b' before the hextet: b00 → bb00
