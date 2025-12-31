@@ -9,11 +9,38 @@
  */
 
 return [
+    // ================================================================
+    // CREDENTIALS (KEEP PRIVATE - Set permissions to 600)
+    // ================================================================
     // TenantOS API Token (from User Settings → API)
-    'api_token' => 'ENTER_YOUR_TOKEN_STRING_HERE',
+    'api_token' => 'YOUR_TENANTOSAPI_TOKEN_HERE',
     
     // TNSR Script Path
-    'router_script_path' => '/var/www/html/scripts/tnsr-vlan-restconf.php',
+    'router_script_path' => '/var/www/html/app/Custom/EventListeners/tnsr-vlan-restconf.php',
+
+    // ================================================================
+    // VLAN MANAGEMENT CONFIGURATION
+    // ================================================================
+    // VLANs that should never be modified by automation
+    // These VLANs will be skipped for both TNSR configuration and removal
+    'reserved_vlans' => [1],  // VLAN 1 is management/default VLAN
+    
+    // ================================================================
+    // LISTENER BEHAVIOR CONFIGURATION
+    // ================================================================
+    // Subnet tag prefix for dynamic routed subnet allocation
+    // The listener will look for tags starting with this prefix
+    // Examples: "routed48", "routed56", "routed64" will all match prefix "routed"
+    // The number after the prefix determines the CIDR size (/48, /56, /64)
+    'subnet_tag_prefix' => 'routed',
+
+    // ================================================================
+    // LISTENER BEHAVIOR CONFIGURATION
+    // ================================================================
+    // CIDRs to ignore when processing IP assignments
+    // These represent routed subnet allocations that should NOT trigger VLAN automation
+    // Default: Skip /48 and /56 (routed subnets), process /64 (interface assignments)
+    //'skip_ip_assignment_cidrs' => ['48', '56'],
 
     // ================================================================
     // DEBUG CONFIGURATION
@@ -24,7 +51,7 @@ return [
     // Level 1 (Basic): VLAN validation, subnet/switch discovery, critical errors
     // Level 2 (Detailed): Command execution, API calls, placeholder replacement
     // Level 3 (Very Detailed): Everything including full configs, switchfacade logs
-    'debug_level' => 0,
+    'debug_level' => 3,
     
     // Path to debug log file (only used if debug_level > 0)
     'debug_log_path' => '/var/www/html/storage/logs/tenantos-vlan-creation.log', 
@@ -159,9 +186,9 @@ return [
     //   {SERVER_ID}             - Server identifier
     //   {VLAN_ID}               - VLAN number
     //   {MLAG_ID}               - MLAG domain ID (usually same as CHANNEL_GROUP)
-    //   {IPV6_ADDRESS}          - Server host IPv6 address (e.g., XXXX:YYYY:0:bb00::2)
-    //   {IPV6_ROUTED_SUBNET}    - Routed subnet from TenantOS (e.g., XXXX:YYYY:0:b00::/56)
-    //   {IPV6_HOST_SUBNET}      - Calculated host subnet (e.g., XXXX:YYYY:0:bb00::/64)
+    //   {IPV6_ADDRESS}          - Server host IPv6 address (e.g., 2602:f937:0:bb00::2)
+    //   {IPV6_ROUTED_SUBNET}    - Routed subnet from TenantOS (e.g., 2602:f937:0:b00::/56)
+    //   {IPV6_HOST_SUBNET}      - Calculated host subnet (e.g., 2602:f937:0:bb00::/64)
     //   {DATE}                  - Current date
     //
     // ================================================================
