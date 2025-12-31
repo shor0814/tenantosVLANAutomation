@@ -2,6 +2,7 @@
 
 namespace App\Custom\EventListeners;
 
+require_once __DIR__ . '/RequestDebugDumper.php';
 use App\Events\publicEvents\serverIpAssignments\beforeServerIpRemovals;
 use App\Services\networkDevices\devices\networkSwitches\helpers;
 use App\Services\networkDevices\devices\networkSwitches\switchFacade;
@@ -39,50 +40,55 @@ class beforeIpRemovalListener {
         try {
             logActivity("=== beforeIpRemovalListener: Processing IP removal for server {$event->serverId} ===");
             
+            // ================================================================
+            // BYPASS: Check if caller explicitly set performVlanActions=none
+            // ================================================================
+            // This prevents processing when subnets are removed via API with
+            // performVlanActions=none (e.g., routed subnet deallocations)
+            try {
+                $requestData = request()->all();
+                $performVlanActions = $requestData['performVlanActions'] ?? 'perform';
+                
+                if ($performVlanActions === 'none') {
+                    logActivity("Request has performVlanActions=none - skipping VLAN automation");
+                    return;
+                }
+            } catch (\Exception $e) {
+                logActivity("Could not check performVlanActions: " . $e->getMessage());
+                // Continue with normal processing if check fails
+            }
+            
             // Skip if no IPs being deleted
             if (!isset($event->deletedIps) || empty($event->deletedIps)) {
                 logActivity("No IPs being deleted - nothing to process");
                 return;
             }
             
-            // Skip IPv4 removals - VLAN automation only for IPv6
-            $hasIpv6 = false;
+            // Extract /64 host subnet being removed
+            $hostSubnet = null;
             foreach ($event->deletedIps as $ipEntry) {
                 $ip = null;
-                
+    
                 // Handle array of IP strings
                 if (is_array($ipEntry)) {
-                    // If array of strings, first one is usually the IP
                     foreach ($ipEntry as $item) {
-                        if (is_string($item) && (strpos($item, '.') !== false || strpos($item, ':') !== false)) {
+                        if (is_string($item) && strpos($item, ':') !== false) {
                             $ip = $item;
                             break;
                         }
                     }
-                } elseif (is_string($ipEntry)) {
+                } elseif (is_string($ipEntry) && strpos($ipEntry, ':') !== false) {
                     $ip = $ipEntry;
                 }
-                
-                if (!$ip) {
-                    // Log the actual structure for debugging
-                    $ipStructure = is_array($ipEntry) ? json_encode($ipEntry) : var_export($ipEntry, true);
-                    logActivity("WARNING: Could not extract IP from deletedIps entry. Structure: {$ipStructure}");
-                    continue;
-                }
-                
-                logActivity("DEBUG: Checking IP Address: {$ip}");
-                
-                // IPv6 addresses contain colons, IPv4 contain dots
-                if (strpos($ip, ':') !== false) {
-                    $hasIpv6 = true;
-                    if (($this->config['debug_level'] ?? 0) >= 2) {
-                        logActivity("DEBUG: Found IPv6 address: {$ip}");
-                    }
+    
+                if ($ip) {
+                    $hostSubnet = $ip;  // This is the /64 being removed
+                    logActivity("✓ Host subnet being removed: {$ip}");
                     break;
                 }
             }
-            
-            if (!$hasIpv6) {
+
+            if (!$hostSubnet) {
                 logActivity("No IPv6 addresses in removal - VLAN automation only applies to IPv6");
                 return;
             }
@@ -209,22 +215,36 @@ class beforeIpRemovalListener {
                 );
             }
 
-            // Remove from TNSR
+            // Remove from TNSR and TenantOS
             if (!empty($subnets)) {
                 $routedSubnet = $subnets[0];
                 
-                // CRITICAL: Never touch VLAN 1 on TNSR
-                if ($vlan == 1) {
-                    logActivity("⚠ VLAN 1 is reserved for management - skipping TNSR removal");
+                // Convert host subnet to gateway format for TNSR: 2602:f937:1:186::/64 → 2602:f937:1:186::1/64
+                $gatewayIp = preg_replace('/::\//', '::1/', $hostSubnet);
+                
+                // Check if VLAN is reserved (from config)
+                $reservedVlans = $this->config['reserved_vlans'] ?? [1];
+                if (in_array($vlan, $reservedVlans)) {
+                    logActivity("⚠ VLAN {$vlan} is reserved - skipping TNSR removal");
                 } else {
-                    logActivity("Removing TNSR VLAN {$vlan} for subnet {$routedSubnet}");
+                    logActivity("Removing TNSR VLAN {$vlan} with gateway IP {$gatewayIp} and routed subnet {$routedSubnet}");
                     
-                    $success = $this->removeTnsrVlan($routedSubnet, $vlan);
+                    // Remove both host and routed subnets from TNSR
+                    $success = $this->removeTnsrVlan($gatewayIp, $routedSubnet, $vlan);
                     if ($success) {
                         logActivity("✓ TNSR deletion succeeded");
                     } else {
                         logActivity("✗ TNSR deletion failed");
                     }
+                }
+                
+                // Delete routed subnet from TenantOS API
+                logActivity("Deleting routed subnet from TenantOS API");
+                $apiSuccess = $this->deleteRoutedSubnetFromApi($event->serverId, $routedSubnet);
+                if ($apiSuccess) {
+                    logActivity("✓ Routed subnet deleted from TenantOS");
+                } else {
+                    logActivity("✗ Failed to delete routed subnet from TenantOS");
                 }
             }
 
@@ -253,21 +273,27 @@ class beforeIpRemovalListener {
             }
             $switchName = $switchInfo['name'];
 
-            $vendor = 'arista';
-            if (stripos($switchName, 'juniper') !== false) {
-                $vendor = 'juniper';
+            // Get vendor from switch management info (from API)
+            // Extract vendor name from managementVendor field: "aristaSsh" → "arista"
+            $managementVendor = $switchInfo['managementVendor'] ?? '';
+            $vendor = preg_replace('/Ssh$/i', '', $managementVendor);
+            $vendor = strtolower($vendor);
+            
+            if (empty($vendor)) {
+                logActivity("[Switch $swId] ERROR: Could not determine vendor from managementVendor: {$managementVendor}");
+                return false;
             }
-
-            // Load removal template
+            
+            // Verify removal template exists for this vendor
             $templatePath = $this->config['switch_removal_templates'][$vendor] ?? null;
             if (!$templatePath || !file_exists($templatePath)) {
-                logActivity("[Switch $swId] ERROR: No removal template found at $templatePath");
+                logActivity("[Switch $swId] ERROR: No removal template found for vendor '{$vendor}'. Configure in switch_removal_templates.");
                 return false;
             }
 
             $template = file_get_contents($templatePath);
             if (($this->config['debug_level'] ?? 0) >= 1) {
-                logActivity("[Switch $swId] Loaded removal template for $vendor");
+                logActivity("[Switch $swId] Loaded removal template for vendor '{$vendor}' (from managementVendor: {$managementVendor})");
             }
 
             // Extract channel group and port number from port name
@@ -786,6 +812,7 @@ class beforeIpRemovalListener {
                 ->where('servers_id', $serverId)
                 ->where('isSubnet', 1)
                 ->where('ip', 'like', '%:%')
+                ->where('ip', 'not like', '%/64%')  // Exclude host /64 subnets, only get routed /48 or /56
                 ->pluck('ip')
                 ->toArray();
         } catch (\Exception $e) {
@@ -795,34 +822,17 @@ class beforeIpRemovalListener {
 
     /**
      * Calculate gateway using TNSR pattern
-     * XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::1/64
+     * 2602:f937:0:b00::/56 → 2602:f937:0:bb00::1/64
      */
-    private function calculateGateway($subnet, $vlan) {
-        try {
-            if (preg_match('/^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:)([0-9a-f]+)(::\/56)$/i', $subnet, $matches)) {
-                $prefix = $matches[1];     // XXXX:YYYY:0:
-                $hextet = $matches[2];     // b00
-                
-                // Insert 'b' before the hextet: b00 → bb00
-                $gatewayHextet = 'b' . $hextet;
-                
-                // Return as gateway with ::1
-                return $prefix . $gatewayHextet . '::1/64';
-            }
-            
-            return null;
-        } catch (\Exception $e) {
-            return null;
-        }
-    }
-
     /**
      * Execute TNSR script for deletion
-     * Requires: php tnsr-vlan-restconf-FIXED.php delete {subnet} {vlan}
+     * Gateway IP is passed already in correct format (::1/CIDR)
+     * Removes both host subnet and routed subnet from TNSR
+     * Requires: php tnsr-vlan-restconf.php delete {gatewayIp} {routedSubnet} {vlan}
      */
-    private function removeTnsrVlan($subnet, $vlan) {
+    private function removeTnsrVlan($gatewayIp, $routedSubnet, $vlan) {
         try {
-            $scriptPath = $this->config['router_script_path'] ?? '/var/www/html/scripts/tnsr-vlan-restconf-FIXED.php';
+            $scriptPath = $this->config['router_script_path'] ?? '/var/www/html/scripts/tnsr-vlan-restconf.php';
             
             if (!file_exists($scriptPath)) {
                 logActivity("[VLAN-REMOVAL] ERROR: Script not found: {$scriptPath}");
@@ -830,12 +840,13 @@ class beforeIpRemovalListener {
             }
 
             if (($this->config['debug_level'] ?? 0) >= 2) {
-                logActivity("[VLAN-REMOVAL] Executing: php {$scriptPath} delete {$subnet} {$vlan}");
+                logActivity("[VLAN-REMOVAL] Executing: php {$scriptPath} delete {$gatewayIp} {$routedSubnet} {$vlan}");
             }
 
-            exec(sprintf('php %s delete %s %d 2>&1',
+            exec(sprintf('php %s delete %s %s %d 2>&1',
                 escapeshellarg($scriptPath),
-                escapeshellarg($subnet),
+                escapeshellarg($gatewayIp),
+                escapeshellarg($routedSubnet),
                 (int)$vlan
             ), $output, $returnCode);
 
@@ -854,6 +865,51 @@ class beforeIpRemovalListener {
 
         } catch (\Exception $e) {
             logActivity("[VLAN-REMOVAL] Exception: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Delete routed subnet from TenantOS via API
+     * Calls: DELETE /api/servers/{id}/ipassignments/0
+     * Body: {"ip": "{routedSubnet}", "performVlanActions": "none"}
+     */
+    private function deleteRoutedSubnetFromApi($serverId, $routedSubnet) {
+        try {
+            $baseUrl = rtrim(config('app.url'), '/');
+            $apiToken = $this->config['api_token'] ?? null;
+            
+            if (!$apiToken) {
+                logActivity("[API-REMOVAL] ERROR: API token not configured");
+                return false;
+            }
+            
+            $url = "{$baseUrl}/api/servers/{$serverId}/ipassignments/0";
+            
+            if (($this->config['debug_level'] ?? 0) >= 2) {
+                logActivity("[API-REMOVAL] DELETE {$url} with subnet: {$routedSubnet}");
+            }
+            
+            $payload = [
+                'ip' => $routedSubnet,
+                'performVlanActions' => 'none',  // Don't trigger listener again
+            ];
+            
+            $response = Http::withHeaders([
+                'Authorization' => "Bearer {$apiToken}",
+            ])->delete($url, $payload);
+            
+            if ($response->successful()) {
+                logActivity("[API-REMOVAL] ✓ Successfully deleted subnet {$routedSubnet} from server {$serverId}");
+                return true;
+            } else {
+                logActivity("[API-REMOVAL] ERROR: API call failed with status " . $response->status());
+                logActivity("[API-REMOVAL] Response: " . $response->body());
+                return false;
+            }
+            
+        } catch (\Exception $e) {
+            logActivity("[API-REMOVAL] Exception: " . $e->getMessage());
             return false;
         }
     }
@@ -1250,7 +1306,7 @@ class beforeIpRemovalListener {
 
             return [
                 'name' => $result['name'] ?? null,
-                'vendor' => $result['statusCache']['content']['result'] ?? null,
+                'managementVendor' => $result['managementVendor'] ?? null,
             ];
 
         } catch (\Exception $e) {
