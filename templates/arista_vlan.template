@@ -41,6 +41,18 @@ interface ethernet{PORT_STRING}
 !   ipv6 access-group ACL_SERVER_{SERVER_ID}_V6_IN in
    spanning-tree portfast edge
    no shutdown
+
+! ================================================================
+! Add VLAN to Uplink
+! ================================================================
+interface ethernet1/1
+  switchport trunk allowed vlan add {VLAN_ID}
+
+! ================================================================
+! Add Vlan interface
+! ================================================================
+interface Vlan{VLAN_ID}
+   ip helper-address {IPV4_ADDRESS}
    
 ! LACP/Port-Channel Configuration (if MLAG enabled)
 ! This section will be populated with channel-group and lacp commands
