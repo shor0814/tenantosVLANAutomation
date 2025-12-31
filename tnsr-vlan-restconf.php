@@ -9,9 +9,9 @@
  */
 
 $config = [
-    'tnsr_host'        => '10.10.10.3',
-    'tnsr_username'    => 'USERNAME',
-    'tnsr_password'    => 'PASSWORD',
+    'tnsr_host'        => 'XX.YY.10.3',
+    'tnsr_username'    => 'TNSRUSERNAME',
+    'tnsr_password'    => 'TNSRPASSWORD',
     'tnsr_port'        => 443,
     'parent_interface' => 'FortyGigabitEthernet65/0/1',
     'ipv6_prefix'      => 'XXXX:YYYY:0:',
@@ -106,24 +106,32 @@ function tnsr_restconf_request($method, $path, $data = null) {
     ];
 }
 
-function create_subinterface($subnet, $vlan) {
+function create_subinterface($gatewayIp, $routedSubnet, $vlan) {
     global $config;
 
-    if (!preg_match('/^[0-9a-f:]+\/56$/i', $subnet)) {
-        throw new Exception("Invalid subnet: $subnet");
+    // Validate gateway IP is in correct format (::1/CIDR)
+    if (!preg_match('/^[0-9a-f:]+::1\/\d+$/i', $gatewayIp)) {
+        throw new Exception("Invalid gateway IP format: $gatewayIp (must be ::1/CIDR, e.g., XXXX:YYYY:0:bb00::1/64)");
     }
+    
+    // Validate routed subnet is /48 or /56
+    if (!preg_match('/^[0-9a-f:]+\/(48|56)$/i', $routedSubnet)) {
+        throw new Exception("Invalid routed subnet: $routedSubnet (must be /48 or /56)");
+    }
+    
     if ($vlan < 1 || $vlan > 4094) {
         throw new Exception("Invalid VLAN: $vlan");
     }
 
-    $gatewayPrefix = extract_gateway_prefix($subnet, $config['ipv6_prefix']);
-    $gatewayIp = $gatewayPrefix . '::1';
-    $customerLinkIp = $gatewayPrefix . '::2';
+    // Gateway IP is already in correct format: XXXX:YYYY:1:186::1/64
+    // Derive customer link IP for next-hop: replace ::1 with ::2, remove CIDR
+    $customerLinkIp = preg_replace('/::1\/\d+$/', '::2', $gatewayIp);  // XXXX:YYYY:1:186::1/64 → XXXX:YYYY:1:186::2
 
     log_msg("Creating TNSR subinterface", 'INFO');
-    log_msg("  Subnet: $subnet", 'INFO');
+    log_msg("  Gateway IP: $gatewayIp", 'INFO');
+    log_msg("  Customer Link IP (next-hop): $customerLinkIp", 'INFO');
+    log_msg("  Routed subnet: $routedSubnet", 'INFO');
     log_msg("  VLAN: $vlan", 'INFO');
-    log_msg("  Gateway: $gatewayIp/64", 'INFO');
     echo "\n";
 
     try {
@@ -155,7 +163,7 @@ function create_subinterface($subnet, $vlan) {
                     'enabled' => true,
                     'ipv6' => [
                         'address' => [
-                            'ip' => ["$gatewayIp/64"]
+                            'ip' => [$gatewayIp]  // Already includes CIDR, e.g., XXXX:YYYY:0:bb00::1/64
                         ]
                     ]
                 ]
@@ -166,6 +174,10 @@ function create_subinterface($subnet, $vlan) {
         log_msg("✓ Interface configured", 'SUCCESS');
 
         log_msg("Step 3: Configuring router advertisements", 'INFO');
+        
+        // Extract prefix from gateway IP: XXXX:YYYY:1:186::1/64 → XXXX:YYYY:1:186::/64
+        $prefixSpec = preg_replace('/::1\//', '::/', $gatewayIp);  // Replace ::1/ with ::/ (preserving slash)
+        
         $raConfig = [
             'netgate-ipv6-ra:ipv6-router-advertisements' => [
                 'send-advertisements' => true,
@@ -173,7 +185,7 @@ function create_subinterface($subnet, $vlan) {
                 'prefix-list' => [
                     'prefix' => [
                         [
-                            'prefix-spec' => $gatewayPrefix . '::/64',
+                            'prefix-spec' => $prefixSpec,
                             'valid-lifetime' => 2592000,
                             'preferred-lifetime' => 604800,
                             'on-link-flag' => true,
@@ -213,14 +225,18 @@ function create_subinterface($subnet, $vlan) {
             ];
         }
 
-        $newRoute = [
-            'destination-prefix' => $subnet,
-            'next-hop' => [
-                'hop' => [
-                    [
-                        'hop-id' => 0,
-                        'ipv6-address' => $customerLinkIp,
-                        'if-name' => $subifName
+        $newRoutes = [
+            // Route for routed subnet (/48 or /56) only
+            // The /64 host subnet is directly on the interface, so no explicit route needed
+            [
+                'destination-prefix' => $routedSubnet,
+                'next-hop' => [
+                    'hop' => [
+                        [
+                            'hop-id' => 0,
+                            'ipv6-address' => $customerLinkIp,
+                            'if-name' => $subifName
+                        ]
                     ]
                 ]
             ]
@@ -233,35 +249,43 @@ function create_subinterface($subnet, $vlan) {
             ];
         }
 
-        $routeExists = false;
-        foreach ($routeConfig[$configKey]['static-routes']['route-table'] as &$table) {
-            if (($table['name'] ?? 'unknown') === 'default') {
-                if (!isset($table['ipv6-routes'])) {
-                    $table['ipv6-routes'] = ['route' => []];
-                }
-                if (!isset($table['ipv6-routes']['route'])) {
-                    $table['ipv6-routes']['route'] = [];
-                }
-
-                foreach ($table['ipv6-routes']['route'] as $existingRoute) {
-                    if (($existingRoute['destination-prefix'] ?? '') === $subnet) {
-                        $routeExists = true;
-                        break;
+        $routesAdded = [];
+        foreach ($newRoutes as $newRoute) {
+            $routeExists = false;
+            $destination = $newRoute['destination-prefix'];
+            
+            foreach ($routeConfig[$configKey]['static-routes']['route-table'] as &$table) {
+                if (($table['name'] ?? 'unknown') === 'default') {
+                    if (!isset($table['ipv6-routes'])) {
+                        $table['ipv6-routes'] = ['route' => []];
                     }
-                }
+                    if (!isset($table['ipv6-routes']['route'])) {
+                        $table['ipv6-routes']['route'] = [];
+                    }
 
-                if (!$routeExists) {
-                    $table['ipv6-routes']['route'][] = $newRoute;
+                    foreach ($table['ipv6-routes']['route'] as $existingRoute) {
+                        if (($existingRoute['destination-prefix'] ?? '') === $destination) {
+                            $routeExists = true;
+                            break;
+                        }
+                    }
+
+                    if (!$routeExists) {
+                        $table['ipv6-routes']['route'][] = $newRoute;
+                        $routesAdded[] = $destination;
+                    } else {
+                        log_msg("Route already exists for $destination", 'INFO');
+                    }
+                    break;
                 }
-                break;
             }
         }
 
-        if ($routeExists) {
-            log_msg("Route already exists", 'INFO');
-        } else {
+        if (!empty($routesAdded)) {
             tnsr_restconf_request('PATCH', '/data/netgate-route-table:route-table-config', $routeConfig);
-            log_msg("✓ Route added", 'SUCCESS');
+            log_msg("✓ Routes added: " . implode(', ', $routesAdded), 'SUCCESS');
+        } else {
+            log_msg("All routes already exist", 'INFO');
         }
 
         log_msg("✓ Subinterface created successfully", 'SUCCESS');
@@ -273,15 +297,22 @@ function create_subinterface($subnet, $vlan) {
     }
 }
 
-function delete_subinterface($subnet, $vlan) {
+function delete_subinterface($gatewayIp, $routedSubnet, $vlan) {
     global $config;
 
-    if (!preg_match('/^[0-9a-f:]+\/56$/i', $subnet)) {
-        throw new Exception("Invalid subnet: $subnet");
+    // Validate gateway IP is in correct format (::1/CIDR)
+    if (!preg_match('/^[0-9a-f:]+::1\/\d+$/i', $gatewayIp)) {
+        throw new Exception("Invalid gateway IP format: $gatewayIp (must be ::1/CIDR)");
+    }
+    
+    // Validate routed subnet is /48 or /56
+    if (!preg_match('/^[0-9a-f:]+\/(48|56)$/i', $routedSubnet)) {
+        throw new Exception("Invalid routed subnet: $routedSubnet (must be /48 or /56)");
     }
 
     log_msg("Deleting TNSR subinterface", 'INFO');
-    log_msg("  Subnet: $subnet", 'INFO');
+    log_msg("  Gateway IP: $gatewayIp", 'INFO');
+    log_msg("  Routed subnet: $routedSubnet", 'INFO');
     log_msg("  VLAN: $vlan", 'INFO');
     echo "\n";
 
@@ -289,22 +320,29 @@ function delete_subinterface($subnet, $vlan) {
         $interface = $config['parent_interface'];
         $subifName = "$interface.$vlan";
 
-        log_msg("Deleting route", 'DEBUG');
+        log_msg("Deleting routes", 'DEBUG');
         $getResult = tnsr_restconf_request('GET', '/data/netgate-route-table:route-table-config');
         $routeConfig = $getResult['response'] ?? [];
 
         if (!empty($routeConfig)) {
-            $found = false;
+            $routesDeleted = [];
             $configKey = 'netgate-route-table:route-table-config';
+            
+            // Delete route for routed subnet only
+            // The /64 host subnet is directly on the interface, so no route to delete
+            $subnetsToDelete = [$routedSubnet];
+            
             if (isset($routeConfig[$configKey]['static-routes']['route-table'])) {
                 foreach ($routeConfig[$configKey]['static-routes']['route-table'] as &$table) {
                     if (($table['name'] ?? 'unknown') === 'default') {
                         if (isset($table['ipv6-routes']['route'])) {
-                            foreach ($table['ipv6-routes']['route'] as $key => $route) {
-                                if (($route['destination-prefix'] ?? '') === $subnet) {
-                                    unset($table['ipv6-routes']['route'][$key]);
-                                    $found = true;
-                                    break;
+                            foreach ($subnetsToDelete as $subnetToDelete) {
+                                foreach ($table['ipv6-routes']['route'] as $key => $route) {
+                                    if (($route['destination-prefix'] ?? '') === $subnetToDelete) {
+                                        unset($table['ipv6-routes']['route'][$key]);
+                                        $routesDeleted[] = $subnetToDelete;
+                                        break;
+                                    }
                                 }
                             }
                             $table['ipv6-routes']['route'] = array_values($table['ipv6-routes']['route']);
@@ -314,7 +352,7 @@ function delete_subinterface($subnet, $vlan) {
                 }
             }
 
-            if ($found) {
+            if (!empty($routesDeleted)) {
                 tnsr_restconf_request('PUT', '/data/netgate-route-table:route-table-config', $routeConfig);
                 log_msg("✓ Route deleted", 'SUCCESS');
             }
@@ -339,19 +377,25 @@ function delete_subinterface($subnet, $vlan) {
     }
 }
 
-function verify_subinterface($subnet, $vlan) {
+function verify_subinterface($gatewayIp, $routedSubnet, $vlan) {
     global $config;
 
-    if (!preg_match('/^[0-9a-f:]+\/56$/i', $subnet)) {
-        throw new Exception("Invalid subnet: $subnet");
+    // Validate gateway IP is in correct format (::1/CIDR)
+    if (!preg_match('/^[0-9a-f:]+::1\/\d+$/i', $gatewayIp)) {
+        throw new Exception("Invalid gateway IP format: $gatewayIp (must be ::1/CIDR)");
+    }
+    
+    // Validate routed subnet is /48 or /56
+    if (!preg_match('/^[0-9a-f:]+\/(48|56)$/i', $routedSubnet)) {
+        throw new Exception("Invalid routed subnet: $routedSubnet (must be /48 or /56)");
     }
 
     $interface = $config['parent_interface'];
     $subifName = "$interface.$vlan";
-    $gatewayPrefix = extract_gateway_prefix($subnet, $config['ipv6_prefix']);
-    $gatewayIp = $gatewayPrefix . '::1';
 
     log_msg("Verifying subinterface", 'INFO');
+    log_msg("  Gateway IP: $gatewayIp", 'INFO');
+    log_msg("  Routed subnet: $routedSubnet", 'INFO');
     echo "\n";
 
     $allPassed = true;
@@ -382,7 +426,7 @@ function verify_subinterface($subnet, $vlan) {
                     $ipv6Routes = $table['ipv6-routes'] ?? [];
                     $routes = $ipv6Routes['route'] ?? [];
                     foreach ($routes as $route) {
-                        if (($route['destination-prefix'] ?? '') === $subnet) {
+                        if (($route['destination-prefix'] ?? '') === $routedSubnet) {
                             $found = true;
                             break;
                         }
@@ -391,9 +435,9 @@ function verify_subinterface($subnet, $vlan) {
             }
 
             if ($found) {
-                log_msg("✓ Static route for $subnet exists", 'SUCCESS');
+                log_msg("✓ Static route for $routedSubnet exists", 'SUCCESS');
             } else {
-                log_msg("✗ Static route for $subnet not found", 'ERROR');
+                log_msg("✗ Static route for $routedSubnet not found", 'ERROR');
                 $allPassed = false;
             }
         }
@@ -461,100 +505,100 @@ function show_usage() {
     echo "\n";
     echo "╔═══════════════════════════════════════════════════════════════════════════════╗\n";
     echo "║  TNSR VLAN Management Script - RESTCONF API                                   ║\n";
-    echo "║  Version: 3.4 - Production Ready                                              ║\n";
+    echo "║  Version: 3.4 - Production Ready (Fixed & Routed Subnets)                     ║\n";
     echo "╚═══════════════════════════════════════════════════════════════════════════════╝\n";
     echo "\n";
     
     echo "CONFIGURATION:\n";
     echo "  TNSR Host:          {$host}\n";
     echo "  Parent Interface:   {$parent}\n";
-    echo "  Log File:           {$config['log_file']}\n";
     echo "\n";
     
     echo "USAGE:\n";
-    echo "  php tnsr-vlan-restconf-FIXED-enhanced.php <COMMAND> [SUBNET] [VLAN_ID]\n";
+    echo "  php tnsr-vlan-restconf.php <COMMAND> <FIXED_SUBNET> <ROUTED_SUBNET> <VLAN_ID>\n";
+    echo "\n";
+    echo "  Where:\n";
+    echo "    <FIXED_SUBNET>    = Host /64 subnet in gateway format (e.g., XXXX:YYYY:1:186::1/64)\n";
+    echo "    <ROUTED_SUBNET>   = Routed /48 or /56 subnet (e.g., XXXX:YYYY:1:200::/48)\n";
+    echo "    <VLAN_ID>         = VLAN number as integer (e.g., 101)\n";
     echo "\n";
     
     echo "COMMANDS:\n";
     echo "\n";
     
     echo "  ┌─ CREATE VLAN ────────────────────────────────────────────────────────────────┐\n";
-    echo "  │ Command:  php tnsr-vlan-restconf-FIXED-enhanced.php create <subnet> <vlan>   │\n";
+    echo "  │ Command:  php tnsr-vlan-restconf.php create <fixed/64> <routed/48-56> <vlan> │\n";
     echo "  │                                                                              │\n";
-    echo "  │ Purpose:  Create a new VLAN with IPv6 subnet and static route                │\n";
+    echo "  │ Purpose:  Create a VLAN with both fixed (host) and routed subnets             │\n";
     echo "  │                                                                              │\n";
-    echo "  │ Example:                                                                     │\n";
-    echo "  │   php tnsr-vlan-restconf-FIXED-enhanced.php create XXXX:YYYY:0:b00::/56 103  │\n";
+    echo "  │ Examples:                                                                    │\n";
+    echo "  │   Create with /48 routed subnet:                                             │\n";
+    echo "  │     php tnsr-vlan-restconf.php create XXXX:YYYY:1:186::1/64 XXXX:YYYY:1:200::/48 101│\n";
+    echo "  │                                                                              │\n";
+    echo "  │   Create with /56 routed subnet:                                             │\n";
+    echo "  │     php tnsr-vlan-restconf.php create XXXX:YYYY:1:187::1/64 XXXX:YYYY:2::/56 102│\n";
     echo "  │                                                                              │\n";
     echo "  │ What it does:                                                                │\n";
-    echo "  │   1. Creates subinterface: FortyGigabitEthernet65/0/1.103                    │\n";
-    echo "  │   2. Configures IPv6 address: XXXX:YYYY:0:b00::/56                           │\n";
-    echo "  │   3. Creates static route with gateway                                       │\n";
-    echo "  │                                                                              │\n";
-    echo "  │ Parameters:                                                                  │\n";
-    echo "  │   <subnet>  IPv6 subnet in CIDR notation (e.g., XXXX:YYYY:0:b00::/56)        │\n";
-    echo "  │   <vlan>    VLAN ID as integer (e.g., 103)                                   │\n";
+    echo "  │   1. Creates subinterface: {$parent}.101                                    │\n";
+    echo "  │   2. Assigns gateway IP to subinterface (::1 address)                        │\n";
+    echo "  │   3. Configures router advertisements for host subnet                       │\n";
+    echo "  │   4. Creates static route for routed subnet pointing to server's next-hop    │\n";
     echo "  │                                                                              │\n";
     echo "  │ Return:  0 on success, 1 on failure                                          │\n";
     echo "  └──────────────────────────────────────────────────────────────────────────────┘\n";
     echo "\n";
     
     echo "  ┌─ DELETE VLAN ────────────────────────────────────────────────────────────────┐\n";
-    echo "  │ Command:  php tnsr-vlan-restconf-FIXED-enhanced.php delete <subnet> <vlan>   │\n";
+    echo "  │ Command:  php tnsr-vlan-restconf.php delete <fixed/64> <routed/48-56> <vlan>│\n";
     echo "  │                                                                              │\n";
     echo "  │ Purpose:  Remove a VLAN and all associated configurations                    │\n";
     echo "  │                                                                              │\n";
-    echo "  │ Example:                                                                     │\n";
-    echo "  │   php tnsr-vlan-restconf-FIXED-enhanced.php delete XXXX:YYYY:0:b00::/56 103  │\n";
+    echo "  │ Examples:                                                                    │\n";
+    echo "  │   Delete VLAN with /48 routed subnet:                                        │\n";
+    echo "  │     php tnsr-vlan-restconf.php delete XXXX:YYYY:1:186::1/64 XXXX:YYYY:1:200::/48 101│\n";
+    echo "  │                                                                              │\n";
+    echo "  │   Delete VLAN with /56 routed subnet:                                        │\n";
+    echo "  │     php tnsr-vlan-restconf.php delete XXXX:YYYY:1:187::1/64 XXXX:YYYY:2::/56 102│\n";
     echo "  │                                                                              │\n";
     echo "  │ What it does:                                                                │\n";
-    echo "  │   1. Deletes static route for: XXXX:YYYY:0:b00::/56                          │\n";
-    echo "  │   2. Removes interface config: FortyGigabitEthernet65/0/1.103                │\n";
-    echo "  │   3. Deletes subinterface definition                                         │\n";
-    echo "  │                                                                              │\n";
-    echo "  │ Parameters:                                                                  │\n";
-    echo "  │   <subnet>  IPv6 subnet to delete (e.g., XXXX:YYYY:0:b00::/56)               │\n";
-    echo "  │   <vlan>    VLAN ID to delete (e.g., 103)                                    │\n";
+    echo "  │   1. Removes static route for routed subnet                                  │\n";
+    echo "  │   2. Deletes interface configuration                                         │\n";
+    echo "  │   3. Removes subinterface definition                                         │\n";
     echo "  │                                                                              │\n";
     echo "  │ Return:  0 on success, 1 on failure                                          │\n";
     echo "  └──────────────────────────────────────────────────────────────────────────────┘\n";
     echo "\n";
     
     echo "  ┌─ VERIFY VLAN ────────────────────────────────────────────────────────────────┐\n";
-    echo "  │ Command:  php tnsr-vlan-restconf-FIXED-enhanced.php verify <subnet> <vlan>   │\n";
+    echo "  │ Command:  php tnsr-vlan-restconf.php verify <fixed/64> <routed/48-56> <vlan>│\n";
     echo "  │                                                                              │\n";
-    echo "  │ Purpose:  Verify that a VLAN exists and is properly configured               │\n";
+    echo "  │ Purpose:  Verify VLAN exists and is correctly configured                    │\n";
     echo "  │                                                                              │\n";
-    echo "  │ Example:                                                                     │\n";
-    echo "  │   php tnsr-vlan-restconf-FIXED-enhanced.php verify XXXX:YYYY:0:b00::/56 103  │\n";
+    echo "  │ Examples:                                                                    │\n";
+    echo "  │   Verify VLAN with /48 routed subnet:                                        │\n";
+    echo "  │     php tnsr-vlan-restconf.php verify XXXX:YYYY:1:186::1/64 XXXX:YYYY:1:200::/48 101│\n";
+    echo "  │                                                                              │\n";
+    echo "  │   Verify VLAN with /56 routed subnet:                                        │\n";
+    echo "  │     php tnsr-vlan-restconf.php verify XXXX:YYYY:1:187::1/64 XXXX:YYYY:2::/56 102│\n";
     echo "  │                                                                              │\n";
     echo "  │ What it checks:                                                              │\n";
-    echo "  │   1. Subinterface exists: FortyGigabitEthernet65/0/1.103                     │\n";
-    echo "  │   2. IPv6 subnet configured: XXXX:YYYY:0:b00::/56                            │\n";
-    echo "  │   3. Static route exists for the subnet                                      │\n";
-    echo "  │                                                                              │\n";
-    echo "  │ Parameters:                                                                  │\n";
-    echo "  │   <subnet>  IPv6 subnet to verify (e.g., XXXX:YYYY:0:b00::/56)               │\n";
-    echo "  │   <vlan>    VLAN ID to verify (e.g., 103)                                    │\n";
+    echo "  │   1. Subinterface exists and is enabled                                      │\n";
+    echo "  │   2. Gateway IP configured on subinterface                                   │\n";
+    echo "  │   3. Static route for routed subnet exists                                   │\n";
     echo "  │                                                                              │\n";
     echo "  │ Return:  0 if all checks pass, 1 if any fail                                 │\n";
     echo "  └──────────────────────────────────────────────────────────────────────────────┘\n";
     echo "\n";
     
     echo "  ┌─ LIST ALL VLANS ─────────────────────────────────────────────────────────────┐\n";
-    echo "  │ Command:  php tnsr-vlan-restconf-FIXED-enhanced.php list                     │\n";
+    echo "  │ Command:  php tnsr-vlan-restconf.php list                                    │\n";
     echo "  │                                                                              │\n";
-    echo "  │ Purpose:  Display all configured VLANs and their IPv6 subnets                │\n";
+    echo "  │ Purpose:  Display all configured VLAN subinterfaces                          │\n";
     echo "  │                                                                              │\n";
     echo "  │ Example:                                                                     │\n";
-    echo "  │   php tnsr-vlan-restconf-FIXED-enhanced.php list                             │\n";
+    echo "  │   php tnsr-vlan-restconf.php list                                            │\n";
     echo "  │                                                                              │\n";
-    echo "  │ Output shows:                                                                │\n";
-    echo "  │   Interface Name              Status  IPv6 Subnet                            │\n";
-    echo "  │   FortyGigabitEthernet65/0/1.103  up      XXXX:YYYY:0:b00::/56               │\n";
-    echo "  │   FortyGigabitEthernet65/0/1.104  up      XXXX:YYYY:0:b01::/56               │\n";
-    echo "  │                                                                              │\n";
-    echo "  │ Parameters:  None                                                            │\n";
+    echo "  │ Output shows:  {$parent}.101 (up), {$parent}.102 (up), etc.                  │\n";
     echo "  │                                                                              │\n";
     echo "  │ Return:  0 on success, 1 on error                                            │\n";
     echo "  └──────────────────────────────────────────────────────────────────────────────┘\n";
@@ -562,38 +606,63 @@ function show_usage() {
     
     echo "WORKFLOW EXAMPLES:\n";
     echo "\n";
-    echo "  Create 2 new VLANs:\n";
-    echo "    php tnsr-vlan-restconf-FIXED-enhanced.php create XXXX:YYYY:0:100::/56 100\n";
-    echo "    php tnsr-vlan-restconf-FIXED-enhanced.php create XXXX:YYYY:0:200::/56 200\n";
-    echo "\n";
-    echo "  List all VLANs:\n";
-    echo "    php tnsr-vlan-restconf-FIXED-enhanced.php list\n";
-    echo "\n";
-    echo "  Verify a VLAN exists:\n";
-    echo "    php tnsr-vlan-restconf-FIXED-enhanced.php verify XXXX:YYYY:0:100::/56 100\n";
-    echo "\n";
-    echo "  Delete a VLAN:\n";
-    echo "    php tnsr-vlan-restconf-FIXED-enhanced.php delete XXXX:YYYY:0:100::/56 100\n";
+    echo "  Example 1: Create, Verify, and Delete a VLAN\n";
+    echo "    Server 36: Host XXXX:YYYY:1:186::/64, Routed XXXX:YYYY:1:200::/48\n";
+    echo "    \n";
+    echo "    Create:\n";
+    echo "      php tnsr-vlan-restconf.php create XXXX:YYYY:1:186::1/64 XXXX:YYYY:1:200::/48 101\n";
+    echo "    \n";
+    echo "    Verify:\n";
+    echo "      php tnsr-vlan-restconf.php verify XXXX:YYYY:1:186::1/64 XXXX:YYYY:1:200::/48 101\n";
+    echo "    \n";
+    echo "    Delete:\n";
+    echo "      php tnsr-vlan-restconf.php delete XXXX:YYYY:1:186::1/64 XXXX:YYYY:1:200::/48 101\n";
     echo "\n";
     
-    echo "LOGGING:\n";
-    echo "  All operations are logged to: {$config['log_file']}\n";
-    echo "  Tail the log with: tail -f {$config['log_file']}\n";
+    echo "  Example 2: Multiple servers with different routed subnets\n";
+    echo "    php tnsr-vlan-restconf.php create XXXX:YYYY:1:186::1/64 XXXX:YYYY:1:200::/48 101\n";
+    echo "    php tnsr-vlan-restconf.php create XXXX:YYYY:1:187::1/64 XXXX:YYYY:1:201::/48 102\n";
+    echo "    php tnsr-vlan-restconf.php create XXXX:YYYY:1:188::1/64 XXXX:YYYY:2::/56 103\n";
+    echo "\n";
+    
+    echo "  List all configured VLANs:\n";
+    echo "    php tnsr-vlan-restconf.php list\n";
+    echo "\n";
+    
+    echo "PARAMETER DETAILS:\n";
+    echo "\n";
+    echo "  Fixed Subnet (Host /64):\n";
+    echo "    - Must be gateway IP with ::1 and /64 CIDR\n";
+    echo "    - Example: XXXX:YYYY:1:186::1/64\n";
+    echo "    - Derived from host subnet assigned by TenantOS by adding ::1\n";
+    echo "    - The ::2 will be the server's interface IP\n";
+    echo "\n";
+    echo "  Routed Subnet:\n";
+    echo "    - Network address with /48 or /56 CIDR\n";
+    echo "    - Examples: XXXX:YYYY:1:200::/48 or XXXX:YYYY:2::/56\n";
+    echo "    - Points to server's interface IP (::2 address) as next-hop\n";
+    echo "\n";
+    echo "  VLAN ID:\n";
+    echo "    - Integer from 1-4094\n";
+    echo "    - Assigned by TenantOS from configured VLAN pool\n";
+    echo "    - Used to create subinterface name\n";
     echo "\n";
     
     echo "EXIT CODES:\n";
-    echo "  0 = Success (create, delete, verify all checks passed)\n";
-    echo "  1 = Failure (operation failed or error occurred)\n";
+    echo "  0 = Success\n";
+    echo "  1 = Failure\n";
     echo "\n";
 }
+
 // Main
 if (php_sapi_name() !== 'cli') {
     die("CLI only\n");
 }
 
 $command = $argv[1] ?? null;
-$subnet = $argv[2] ?? null;
-$vlan = $argv[3] ?? null;
+$gatewayIp = $argv[2] ?? null;
+$routedSubnet = $argv[3] ?? null;
+$vlan = $argv[4] ?? null;
 
 if (!$command) {
     show_usage();
@@ -603,27 +672,27 @@ if (!$command) {
 try {
     switch ($command) {
         case 'create':
-            if (!$subnet || !$vlan) {
-                log_msg("Error: create needs subnet and vlan", 'ERROR');
+            if (!$gatewayIp || !$routedSubnet || !$vlan) {
+                log_msg("Error: create needs gatewayIp, routedSubnet, and vlan", 'ERROR');
                 exit(1);
             }
-            create_subinterface($subnet, (int)$vlan);
+            create_subinterface($gatewayIp, $routedSubnet, (int)$vlan);
             break;
 
         case 'delete':
-            if (!$subnet || !$vlan) {
-                log_msg("Error: delete needs subnet and vlan", 'ERROR');
+            if (!$gatewayIp || !$routedSubnet || !$vlan) {
+                log_msg("Error: delete needs gatewayIp, routedSubnet, and vlan", 'ERROR');
                 exit(1);
             }
-            delete_subinterface($subnet, (int)$vlan);
+            delete_subinterface($gatewayIp, $routedSubnet, (int)$vlan);
             break;
 
         case 'verify':
-            if (!$subnet || !$vlan) {
-                log_msg("Error: verify needs subnet and vlan", 'ERROR');
+            if (!$gatewayIp || !$routedSubnet || !$vlan) {
+                log_msg("Error: verify needs gatewayIp, routedSubnet, and vlan", 'ERROR');
                 exit(1);
             }
-            $passed = verify_subinterface($subnet, (int)$vlan);
+            $passed = verify_subinterface($gatewayIp, $routedSubnet, (int)$vlan);
             exit($passed ? 0 : 1);
             break;
 
