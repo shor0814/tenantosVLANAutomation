@@ -1,26 +1,38 @@
 <?php
 
+
 namespace App\Custom\EventListeners;
 
+require_once __DIR__ . '/RequestDebugDumper.php';
 use App\Events\publicEvents\serverIpAssignments\afterServerIpAssignments;
 use App\Services\networkDevices\devices\networkSwitches\helpers;
 use App\Services\networkDevices\devices\networkSwitches\switchFacade;
 use Illuminate\Support\Facades\Http;
 
 /**
- * UPDATED VLAN Automation Listener - Single Routed Subnet with Calculated Host Subnet
+ * UPDATED VLAN Automation Listener - Dynamic Routed Subnet Allocation
  * 
- * SUBNET STRUCTURE (per TNSR pattern):
- * Input from TenantOS: XXXX:YYYY:0:b00::/56 (routed subnet)
- * TNSR calculates:
- *   - Host subnet: XXXX:YYYY:0:bb00::/64 (insert 'b' before third hextet)
- *   - Gateway: XXXX:YYYY:0:bb00::1/64 (first IP of host subnet)
- *   - Host address: XXXX:YYYY:0:bb00::2 (second IP of host subnet)
+ * SUBNET ALLOCATION FLOW:
+ * 1. Listen for /64 interface assignment via TenantOS (performVlanActions=perform)
+ * 2. Check if server already has routed subnet (/48 or /56)
+ * 3. If not, query TenantOS API to find available subnet based on server tags:
+ *    - routed48 tag → allocate from parent 108 (/40)
+ *    - routed56 tag → allocate from parent 635 (/48)
+ * 4. Assign the available subnet via API (performVlanActions=none to prevent recursion)
+ * 5. Calculate host subnet using TNSR pattern
+ * 6. Configure VLAN with routed subnet
  * 
- * Template variables:
- *   {IPV6_ADDRESS}       - Host address (::2)
- *   {IPV6_ROUTED_SUBNET} - Original routed subnet from TenantOS
- *   {IPV6_HOST_SUBNET}   - Calculated host subnet
+ * TNSR HOST SUBNET CALCULATION:
+ * Input: 2602:f937:2::/48 (routed subnet from TenantOS)
+ * TNSR pattern: Insert 'b' before third hextet
+ * Output: 2602:f937:2:bb00::/64 (host subnet)
+ * Host IP: 2602:f937:2:bb00::2
+ * 
+ * ADVANTAGES:
+ * - Dynamically allocates from available pool (no manual tracking)
+ * - Server tags determine which pool to use
+ * - Prevents manual calculation errors
+ * - Cleaner separation: allocation (API) vs automation (listener)
  * 
  * ALL OTHER LOGIC: Unchanged from proven working version
  * - Uses helpers::getServerSwitchConnections() 
@@ -46,51 +58,63 @@ class afterIpAssignmentListener {
         try {
             logActivity("=== afterIpAssignmentListener: Processing server {$event->serverId} ===");
             
+            // ================================================================
+            // BYPASS: Check if caller explicitly set performVlanActions=none
+            // ================================================================
+            // This prevents processing when subnets are assigned via API with
+            // performVlanActions=none (e.g., routed subnet allocations)
+            try {
+                $requestData = request()->all();
+                $performVlanActions = $requestData['performVlanActions'] ?? 'perform';
+                
+                if ($performVlanActions === 'none') {
+                    logActivity("Request has performVlanActions=none - skipping VLAN automation");
+                    return;
+                }
+            } catch (\Exception $e) {
+                logActivity("Could not check performVlanActions: " . $e->getMessage());
+                // Continue with normal processing if check fails
+            }
+            
+            debugDumpRequestData('afterIpAssignmentListener', $event->serverId);
             // Skip if no IPs added
             if (!isset($event->addedIps) || empty($event->addedIps)) {
                 logActivity("No IPs added - nothing to process");
                 return;
             }
             
-            // Skip IPv4 assignments - VLAN automation only for IPv6
-            $hasIpv6 = false;
+            // Extract /64 host subnet from assignment
+            // This IS the host subnet - no calculation needed
+            // Format: 2602:f937:0:bb00::/64 (TNSR will use ::1 for gateway, ::2 for server)
+            $hostSubnet = null;
             foreach ($event->addedIps as $ipEntry) {
                 $ip = null;
-                
+    
                 // Handle array of IP strings
                 if (is_array($ipEntry)) {
-                    // If array of strings, first one is usually the IP
                     foreach ($ipEntry as $item) {
-                        if (is_string($item) && (strpos($item, '.') !== false || strpos($item, ':') !== false)) {
+                        if (is_string($item) && strpos($item, ':') !== false) {
                             $ip = $item;
                             break;
                         }
                     }
-                } elseif (is_string($ipEntry)) {
+                } elseif (is_string($ipEntry) && strpos($ipEntry, ':') !== false) {
                     $ip = $ipEntry;
                 }
-                
-                if (!$ip) {
-                    // Log the actual structure for debugging
-                    $ipStructure = is_array($ipEntry) ? json_encode($ipEntry) : var_export($ipEntry, true);
-                    $this->debugLog("WARNING: Could not extract IP from addedIps entry. Structure: {$ipStructure}", 2);
-                    continue;
-                }
-                
-                $this->debugLog("DEBUG: Checking IP Address: {$ip}", 2);
-                
-                // IPv6 addresses contain colons, IPv4 contain dots
-                if (strpos($ip, ':') !== false) {
-                    $hasIpv6 = true;
-                    $this->debugLog("DEBUG: Found IPv6 address: {$ip}", 2);
+    
+                if ($ip) {
+                    $hostSubnet = $ip;  // This is the /64 host subnet
+                    $this->debugLog("DEBUG: Extracted host subnet: {$ip}", 2);
                     break;
                 }
             }
-            
-            if (!$hasIpv6) {
+
+            if (!$hostSubnet) {
                 logActivity("No IPv6 addresses in assignment - VLAN automation only applies to IPv6");
                 return;
             }
+            
+            logActivity("✓ Host subnet: {$hostSubnet}");
 
             $getSwitches = helpers::getServerSwitchConnections($event->serverId);
             
@@ -231,16 +255,19 @@ class afterIpAssignmentListener {
                 return;
             }
 
-            // Get subnets once (same for all switches in a pair)
-            $subnets = $this->getServerSubnets($event->serverId);
+            // Get routed subnet (allocate if not already assigned)
+            $subnets = $this->getServerSubnets($event->serverId, $hostSubnet);
             if (empty($subnets)) {
-                logActivity("ERROR: Could not find subnet for server {$event->serverId}");
+                logActivity("ERROR: Could not get subnets for server {$event->serverId}");
                 return;
             }
             if (($this->config['debug_level'] ?? 0) >= 1) {
                 logActivity("✓ Routed subnet: {$subnets['routed']}");
                 logActivity("✓ Host subnet: {$subnets['host']}");
             }
+
+            // Calculate gateway IP once: 2602:f937:1:186::/64 → 2602:f937:1:186::1/64
+            $gatewayIp = preg_replace('/::\//', '::1/', $subnets['host']);
 
             // Build processing queue: automation switch first, then peers
             $processingQueue = array_merge([$automationSwitch], $peerSwitches);
@@ -351,24 +378,18 @@ class afterIpAssignmentListener {
             }
 
             // Create TNSR VLAN once (same for all switches)
-            // CRITICAL: Never send VLAN 1 to TNSR (it's reserved for management)
-            if ($vlan == 1) {
-                logActivity("⚠ VLAN 1 is reserved for management - skipping TNSR configuration");
+            // CRITICAL: Never configure reserved VLANs (from config)
+            $reservedVlans = $this->config['reserved_vlans'] ?? [1];
+            if (in_array($vlan, $reservedVlans)) {
+                logActivity("⚠ VLAN {$vlan} is reserved - skipping TNSR configuration");
             } else {
-                logActivity("Configuring TNSR for VLAN $vlan...");
-                $routedSubnet = $subnets['routed'];
-                $gateway = $this->calculateGateway($routedSubnet, $vlan);
-                if (!$gateway) {
-                    logActivity("ERROR: Could not calculate gateway for $routedSubnet");
+                logActivity("Configuring TNSR for VLAN $vlan with gateway IP {$gatewayIp} and routed subnet {$subnets['routed']}");
+                
+                $success = $this->createTnsrVlan($gatewayIp, $subnets['routed'], $vlan);
+                if ($success) {
+                    logActivity("✓ SUCCESS: VLAN $vlan automated on TNSR");
                 } else {
-                    logActivity("✓ Calculated gateway for $routedSubnet: $gateway");
-                    
-                    $success = $this->createTnsrVlan($routedSubnet, $vlan, $gateway);
-                    if ($success) {
-                        logActivity("✓ SUCCESS: VLAN $vlan automated on TNSR for $routedSubnet");
-                    } else {
-                        logActivity("✗ FAILED: TNSR automation failed for $routedSubnet");
-                    }
+                    logActivity("✗ FAILED: TNSR automation failed");
                 }
             }
 
@@ -756,7 +777,7 @@ class afterIpAssignmentListener {
 
             return [
                 'name' => $result['name'] ?? null,
-                'vendor' => $result['statusCache']['content']['result'] ?? null,
+                'managementVendor' => $result['managementVendor'] ?? null,
             ];
 
         } catch (\Exception $e) {
@@ -785,9 +806,25 @@ class afterIpAssignmentListener {
             
             $switchFacade = new switchFacade($switchId);
 
-            $vendor = 'arista';
-            if (stripos($switchName, 'juniper') !== false) {
-                $vendor = 'juniper';
+            // Get vendor from switch management info (from API)
+            // Extract vendor name from managementVendor field: "aristaSsh" → "arista"
+            $managementVendor = $switchInfo['managementVendor'] ?? '';
+            $vendor = preg_replace('/Ssh$/i', '', $managementVendor);
+            $vendor = strtolower($vendor);
+            
+            if (empty($vendor)) {
+                logActivity("[Switch $switchId] ERROR: Could not determine vendor from managementVendor: {$managementVendor}");
+                return false;
+            }
+            
+            // Verify template exists for this vendor
+            if (!isset($this->config['switch_templates'][$vendor])) {
+                logActivity("[Switch $switchId] ERROR: No template found for vendor '{$vendor}'. Configure in switch_templates.");
+                return false;
+            }
+            
+            if (($this->config['debug_level'] ?? 0) >= 1) {
+                logActivity("[Switch $switchId] Using vendor '{$vendor}' (from managementVendor: {$managementVendor})");
             }
 
             $template = $this->loadTemplate($vendor);
@@ -802,14 +839,8 @@ class afterIpAssignmentListener {
 
             $portDescription = "Server {$serverId} - VLAN {$vlanId} - " . date('Y-m-d');
 
-            // Extract subnet values
+            // Extract subnet values for this switch
             $routedSubnet = $subnets['routed'] ?? '';
-            $hostSubnet = $subnets['host'] ?? '';
-            $ipv6Address = $this->calculateHostAddress($hostSubnet);  // ::2 address
-            
-            if (($this->config['debug_level'] ?? 0) >= 1) {
-                logActivity("[Switch $switchId] IPv4: $ipv4Address, Routed Subnet: $routedSubnet, Host Subnet: $hostSubnet, Host Address: $ipv6Address");
-            }
 
             // Prepare LACP/Port-Channel configuration using block templates from config
             $lacpConfig = '';
@@ -892,6 +923,10 @@ class afterIpAssignmentListener {
             // Two-level substitution:
             // 1. Blocks are filled with role-specific values above
             // 2. Blocks are then inserted into template below
+            // Calculate IPv6 address for Arista template (just the ::2, no CIDR)
+            // From host subnet like 2602:f937:1:186::/64, extract prefix and append ::2
+            $hostIpForTemplate = preg_replace('/::\/\d+$/', '::2', $subnets['host']);
+
             $config = $this->replacePlaceholders($template, [
                 'SERVER_ID' => $serverId,
                 'VLAN_ID' => $vlanId,
@@ -905,9 +940,9 @@ class afterIpAssignmentListener {
                 'LACP_CONFIG' => $lacpConfig,
                 'PORT_CHANNEL_CONFIG' => $portChannelConfig,
                 'IPV4_ADDRESS' => $ipv4Address,
-                'IPV6_ADDRESS' => $ipv6Address,
+                'IPV6_ADDRESS' => $hostIpForTemplate,
                 'IPV6_ROUTED_SUBNET' => $routedSubnet,
-                'IPV6_HOST_SUBNET' => $hostSubnet,
+                'IPV6_HOST_SUBNET' => $subnets['host'],
                 'MLAG_DOMAIN' => '1',
                 'MLAG_PRIORITY' => '100',
                 'DATE' => date('Y-m-d H:i:s'),
@@ -930,9 +965,9 @@ class afterIpAssignmentListener {
             $debugLog .= "  CHANNEL_GROUP: {$channelGroup}\n";
             $debugLog .= "  MLAG_ID: {$channelGroup}\n";
             $debugLog .= "  IPV4_ADDRESS: {$ipv4Address}\n";
-            $debugLog .= "  IPV6_ADDRESS: {$ipv6Address}\n";
+            $debugLog .= "  IPV6_ADDRESS: {$hostIpForTemplate}\n";
             $debugLog .= "  IPV6_ROUTED_SUBNET: {$routedSubnet}\n";
-            $debugLog .= "  IPV6_HOST_SUBNET: {$hostSubnet}\n";
+            $debugLog .= "  IPV6_HOST_SUBNET: {$subnets['host']}\n";
             $debugLog .= "  LACP_CONFIG: " . ($lacpConfig ? "[configured]" : "[empty]") . "\n";
             $debugLog .= "  PORT_CHANNEL_CONFIG: " . ($portChannelConfig ? "[configured]" : "[empty]") . "\n";
             $debugLog .= "  MLAG_DOMAIN: 1\n";
@@ -1245,7 +1280,7 @@ class afterIpAssignmentListener {
 
     /**
      * UPDATED: Calculate IPv6 :2 address (server-side)
-     * Example: XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:b00::2
+     * Example: 2602:f937:0:b00::/56 → 2602:f937:0:b00::2
      * Previously calculated ::1 (gateway)
      */
     private function calculateIpv6ServerAddress($subnet) {
@@ -1281,76 +1316,337 @@ class afterIpAssignmentListener {
 
     /**
      * Get routed subnet from database and calculate host subnet and address
-     * The TNSR script converts: XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::
+     * The TNSR script converts: 2602:f937:0:b00::/56 → 2602:f937:0:bb00::
      * Returns array with calculated values for template
      */
-    private function getServerSubnets($serverId) {
+
+
+    /**
+     * Get server subnets - allocate routed if not already assigned
+     * The host subnet is the /64 that was just assigned (no calculation needed)
+     * The routed subnet is allocated from the appropriate pool based on server tags
+     */
+    private function getServerSubnets($serverId, $hostSubnet) {
         try {
+            // First, try to get existing routed subnet from database
             $routedSubnet = \DB::table('ipassignments')
                 ->where('servers_id', $serverId)
                 ->where('isSubnet', 1)
                 ->where('ip', 'like', '%:%')
+                ->where('ip', 'not like', '%/64%')  // Exclude /64 host subnets, we want /48 or /56
                 ->value('ip');
             
+            // If not found, allocate one
             if (!$routedSubnet) {
-                return [];
+                logActivity("No existing routed subnet found - attempting allocation");
+                $routedSubnet = $this->allocateRoutedSubnet($serverId);
+                
+                if (!$routedSubnet) {
+                    logActivity("ERROR: Failed to allocate routed subnet");
+                    return [];
+                }
+                
+                logActivity("✓ Allocated routed subnet: {$routedSubnet}");
+            } else {
+                logActivity("✓ Using existing routed subnet: {$routedSubnet}");
             }
-            
-            // Calculate the host subnet using TNSR pattern
-            // XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::/64
-            $hostSubnet = $this->calculateHostSubnet($routedSubnet);
             
             return [
                 'routed' => $routedSubnet,
-                'host' => $hostSubnet,
+                'host' => $hostSubnet,  // The /64 from the event - no calculation needed
             ];
         } catch (\Exception $e) {
+            logActivity("Error in getServerSubnets: " . $e->getMessage());
             return [];
         }
     }
 
     /**
-     * Calculate host subnet following TNSR pattern
-     * Takes third hextet and inserts 'b' before it
-     * XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::/64
+     * Determine parent subnet ID by querying assignable subnets
+     * Matches based on:
+     * 1. Server tags starting with configured prefix (e.g., "routed")
+     * 2. Extract CIDR number from tag (e.g., "routed48" → /48)
+     * 3. Find parent with correct CIDR difference (8 bits larger)
+     * 
+     * Example:
+     * - Server tag: "routed48"
+     * - Extract: 48
+     * - Look for: parent /40 (creates /48 children, difference of 8 bits)
      */
-    private function calculateHostSubnet($routedSubnet) {
+    private function determineParentSubnet($serverId) {
         try {
-            // Match pattern: XXXX:YYYY:0:XYZ::/56
-            if (preg_match('/^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:)([0-9a-f]+)(::\/56)$/i', $routedSubnet, $matches)) {
-                $prefix = $matches[1];     // XXXX:YYYY:0:
-                $hextet = $matches[2];     // b00
-                
-                // Insert 'b' before the hextet: b00 → bb00
-                $hostHextet = 'b' . $hextet;
-                
-                // Return as /64 (host subnet)
-                return $prefix . $hostHextet . '::/64';
+            $baseUrl = rtrim(config('app.url'), '/');
+            $apiToken = $this->config['api_token'] ?? null;
+            $tagPrefix = $this->config['subnet_tag_prefix'] ?? 'routed';
+            
+            if (!$apiToken) {
+                logActivity("ERROR: API token not configured");
+                return null;
             }
             
+            // Step 1: Get server tags
+            $url = "{$baseUrl}/api/servers/{$serverId}";
+            $response = Http::withHeaders([
+                'Authorization' => "Bearer {$apiToken}",
+            ])->get($url);
+            
+            if (!$response->successful()) {
+                logActivity("ERROR: Failed to get server details");
+                return null;
+            }
+            
+            $server = $response->json()['result'] ?? [];
+            $tags = $server['tags'] ?? [];
+            
+            // Step 2: Find tag matching prefix and extract CIDR number
+            $childCidr = null;
+            $matchedTag = null;
+            
+            foreach ($tags as $tag) {
+                // Check if tag starts with prefix (case-insensitive)
+                if (stripos($tag, $tagPrefix) === 0) {
+                    // Extract the CIDR number after the prefix
+                    // e.g., "routed48" → extract "48"
+                    $cidrPart = substr($tag, strlen($tagPrefix));
+                    
+                    // Verify it's a number (1-3 digits)
+                    if (preg_match('/^(\d{1,3})$/', $cidrPart, $matches)) {
+                        $childCidr = (int)$matches[1];
+                        $matchedTag = $tag;
+                        break;
+                    }
+                }
+            }
+            
+            if ($childCidr === null) {
+                logActivity("WARNING: No tag matching prefix '{$tagPrefix}' found (e.g., routed48, routed56)");
+                return null;
+            }
+            
+            $parentCidr = $childCidr - 8;
+            logActivity("Server tagged as '{$matchedTag}' - looking for parent with /{$parentCidr} (creates /{$childCidr} children)");
+            
+            // Step 3: Query assignable subnets (all pools this server can access)
+            $url = "{$baseUrl}/api/servers/{$serverId}/ipassignments/getAssignableSubnets";
+            
+            if (($this->config['debug_level'] ?? 0) >= 2) {
+                logActivity("[PARENT-MATCH] Querying assignable subnets: GET {$url}");
+            }
+            
+            $response = Http::withHeaders([
+                'Authorization' => "Bearer {$apiToken}",
+            ])->get($url);
+            
+            if (!$response->successful()) {
+                logActivity("ERROR: Failed to query assignable subnets");
+                return null;
+            }
+            
+            $assignableSubnets = $response->json()['result'] ?? [];
+            
+            if (($this->config['debug_level'] ?? 0) >= 2) {
+                logActivity("[PARENT-MATCH-DEBUG] Total assignable subnets returned: " . count($assignableSubnets));
+            }
+            
+            if (empty($assignableSubnets)) {
+                logActivity("ERROR: No assignable subnets returned");
+                return null;
+            }
+            
+            // Step 4: Find correct parent by CIDR size matching
+            foreach ($assignableSubnets as $subnet) {
+                $subnetId = $subnet['id'] ?? 'unknown';
+                
+                // Must have children to allocate from
+                if (!($subnet['type']['hasChildSubnets'] ?? false)) {
+                    $this->debugLog("Skipping subnet {$subnetId} - no child subnets", 2);
+                    continue;
+                }
+                
+                // Get actual CIDR from subnet address
+                if (!preg_match('/\/(\d+)$/', $subnet['subnet'] ?? '', $matches)) {
+                    $this->debugLog("Skipping subnet {$subnetId} - no CIDR size found", 2);
+                    continue;
+                }
+                
+                $parentCidr = (int)$matches[1];
+                
+                // Check CIDR difference (parent must be exactly 8 bits smaller)
+                $cidrDiff = $parentCidr - $childCidr;
+                if ($cidrDiff != -8) {
+                    $neededCidr = $childCidr - 8;
+                    $this->debugLog("[PARENT-MATCH] Subnet {$subnetId} ({$subnet['subnet']}) /{$parentCidr} - CIDR diff {$cidrDiff}, need /{$neededCidr} (diff -8)", 2);
+                    continue;
+                }
+                
+                // Found it! This is the correct parent
+                $parentId = $subnet['id'];
+                $parentSubnet = $subnet['subnet'] ?? 'unknown';
+                logActivity("✓ Found correct parent: ID={$parentId}, subnet={$parentSubnet}, CIDR=/{$parentCidr} (will create /{$childCidr} children)");
+                
+                if (($this->config['debug_level'] ?? 0) >= 3) {
+                    logActivity("[PARENT-MATCH-DEBUG] Selected parent subnet details:");
+                    logActivity(json_encode($subnet, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+                }
+                
+                return $parentId;
+            }
+            
+            logActivity("ERROR: Could not find parent subnet matching tag '{$matchedTag}' with /{$childCidr} children");
             return null;
+            
         } catch (\Exception $e) {
+            logActivity("ERROR determining parent subnet: " . $e->getMessage());
             return null;
         }
     }
 
     /**
-     * Calculate host IP address from host subnet
-     * XXXX:YYYY:0:bb00::/64 → XXXX:YYYY:0:bb00::2
+     * Get first available subnet from parent
+     * Queries TenantOS API to find assignable subnets
      */
-    private function calculateHostAddress($hostSubnet) {
+    private function getFirstAvailableSubnet($serverId, $parentSubnetId) {
         try {
-            if (!$hostSubnet) {
+            $baseUrl = rtrim(config('app.url'), '/');
+            $url = "{$baseUrl}/api/servers/{$serverId}/ipassignments/getAssignableIpsOfSubnet";
+            $apiToken = $this->config['api_token'] ?? null;
+            
+            if (!$apiToken) {
+                logActivity("ERROR: API token not configured");
                 return null;
             }
             
-            // Remove /64 and append ::2
-            return str_replace('::/64', '::2', $hostSubnet);
+            if (($this->config['debug_level'] ?? 0) >= 2) {
+                logActivity("[SUBNET-ALLOCATION] Querying available subnets from parent {$parentSubnetId}");
+            }
+            
+            // Query available subnets from parent
+            $response = Http::withHeaders([
+                'Authorization' => "Bearer {$apiToken}",
+            ])->post($url, [
+                'subnets_id' => $parentSubnetId,
+            ]);
+            
+            if (!$response->successful()) {
+                logActivity("ERROR: Failed to query available subnets: " . $response->status());
+                return null;
+            }
+            
+            // API returns: {"status": "success", "result": [{id, ip, ...}, {id, ip, ...}, ...]}
+            $result = $response->json()['result'] ?? [];
+            
+            if (($this->config['debug_level'] ?? 0) >= 2) {
+                logActivity("[SUBNET-ALLOCATION-DEBUG] Available subnets count: " . count($result));
+            }
+            
+            if (!is_array($result) || empty($result)) {
+                logActivity("ERROR: No available subnets in parent {$parentSubnetId}");
+                return null;
+            }
+            
+            // First available subnet - get the 'ip' field from first object
+            $firstSubnet = $result[0];
+            $availableSubnet = $firstSubnet['ip'] ?? null;
+            
+            if (!$availableSubnet) {
+                logActivity("ERROR: First available subnet has no 'ip' field");
+                if (($this->config['debug_level'] ?? 0) >= 3) {
+                    logActivity("[SUBNET-ALLOCATION-DEBUG] First subnet object: " . json_encode($firstSubnet));
+                }
+                return null;
+            }
+            
+            if (($this->config['debug_level'] ?? 0) >= 2) {
+                logActivity("[SUBNET-ALLOCATION] Found available subnet: {$availableSubnet}");
+            }
+            
+            return $availableSubnet;
+            
         } catch (\Exception $e) {
+            logActivity("ERROR getting available subnet: " . $e->getMessage());
             return null;
         }
     }
 
+    /**
+     * Assign a routed subnet to the server via TenantOS API
+     * Uses performVlanActions=none to prevent double-processing
+     */
+    private function allocateRoutedSubnet($serverId) {
+        try {
+            // Determine which parent subnet to use
+            $parentSubnetId = $this->determineParentSubnet($serverId);
+            if (!$parentSubnetId) {
+                return null;
+            }
+            
+            // Get first available subnet from parent
+            $subnet = $this->getFirstAvailableSubnet($serverId, $parentSubnetId);
+            if (!$subnet) {
+                return null;
+            }
+            
+            // Assign the subnet to the server
+            $baseUrl = rtrim(config('app.url'), '/');
+            $url = "{$baseUrl}/api/servers/{$serverId}/ipassignments";
+            $apiToken = $this->config['api_token'] ?? null;
+            
+            if (!$apiToken) {
+                logActivity("ERROR: API token not configured");
+                return null;
+            }
+            
+            if (($this->config['debug_level'] ?? 0) >= 2) {
+                logActivity("[SUBNET-ALLOCATION] Assigning subnet {$subnet} to server {$serverId}");
+                logActivity("[SUBNET-ALLOCATION] POST {$url}");
+            }
+            
+            $payload = [
+                'subnets_id' => $parentSubnetId,
+                'ips' => [$subnet],
+                'description' => "Routed subnet allocation for VLAN automation - Server {$serverId}",
+                'performVlanActions' => 'none',  // Don't trigger listener again
+            ];
+            
+            if (($this->config['debug_level'] ?? 0) >= 3) {
+                logActivity("[SUBNET-ALLOCATION-DEBUG] Request payload:");
+                logActivity(json_encode($payload, JSON_PRETTY_PRINT));
+            }
+            
+            $response = Http::withHeaders([
+                'Authorization' => "Bearer {$apiToken}",
+            ])->post($url, $payload);
+            
+            if (($this->config['debug_level'] ?? 0) >= 3) {
+                logActivity("[SUBNET-ALLOCATION-DEBUG] Response status: " . $response->status());
+                logActivity("[SUBNET-ALLOCATION-DEBUG] Response body:");
+                logActivity(json_encode($response->json(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            }
+            
+            if (!$response->successful()) {
+                logActivity("ERROR: Failed to assign subnet {$subnet}: " . $response->status());
+                logActivity("ERROR: Response: " . $response->body());
+                return null;
+            }
+            
+            if (($this->config['debug_level'] ?? 0) >= 1) {
+                logActivity("✓ Successfully assigned subnet {$subnet} to server {$serverId}");
+            }
+            return $subnet;
+            
+        } catch (\Exception $e) {
+            logActivity("ERROR allocating routed subnet: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Calculate host subnet following TNSR pattern
+     * Takes the fourth hextet and inserts 'b' before it
+     * 
+     * For /56: 2602:f937:0:b00::/56 → 2602:f937:0:bb00::/64
+     * For /48: 2602:f937:2::/48 → 2602:f937:2:b000::/64
+     */
     private function getVlanFromApi($switchId, $portName, $serverId) {
         try {
             $apiToken = $this->config['api_token'] ?? null;
@@ -1432,9 +1728,9 @@ class afterIpAssignmentListener {
     private function calculateGateway($subnet, $vlan) {
         try {
             // Calculate gateway using same TNSR pattern as host subnet
-            // XXXX:YYYY:0:b00::/56 → XXXX:YYYY:0:bb00::1/64
+            // 2602:f937:0:b00::/56 → 2602:f937:0:bb00::1/64
             if (preg_match('/^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:)([0-9a-f]+)(::\/56)$/i', $subnet, $matches)) {
-                $prefix = $matches[1];     // XXXX:YYYY:0:
+                $prefix = $matches[1];     // 2602:f937:0:
                 $hextet = $matches[2];     // b00
                 
                 // Insert 'b' before the hextet: b00 → bb00
@@ -1450,23 +1746,46 @@ class afterIpAssignmentListener {
         }
     }
 
-    private function createTnsrVlan($subnet, $vlan, $gateway) {
+    /**
+     * Call TNSR script to create VLAN with pre-calculated gateway IP and routed subnet
+     * Gateway IP is already in correct format: ::1/CIDR (no calculation needed)
+     * Signature: php tnsr-vlan-restconf.php create {gatewayIp} {routedSubnet} {vlan}
+     */
+    private function createTnsrVlan($gatewayIp, $routedSubnet, $vlan) {
         try {
-            $scriptPath = $this->config['router_script_path'] ?? '/var/www/html/scripts/tnsr-vlan-restconf-FIXED.php';
+            $scriptPath = $this->config['router_script_path'] ?? '/var/www/html/scripts/tnsr-vlan-restconf.php';
             
             if (!file_exists($scriptPath)) {
+                logActivity("ERROR: TNSR script not found: {$scriptPath}");
                 return false;
             }
 
-            exec(sprintf('php %s create %s %d 2>&1',
+            if (($this->config['debug_level'] ?? 0) >= 2) {
+                logActivity("[TNSR-CREATION] Executing: php {$scriptPath} create {$gatewayIp} {$routedSubnet} {$vlan}");
+            }
+
+            exec(sprintf('php %s create %s %s %d 2>&1',
                 escapeshellarg($scriptPath),
-                escapeshellarg($subnet),
+                escapeshellarg($gatewayIp),
+                escapeshellarg($routedSubnet),
                 (int)$vlan
             ), $output, $returnCode);
 
-            return $returnCode === 0;
+            if ($returnCode === 0) {
+                if (($this->config['debug_level'] ?? 0) >= 2) {
+                    logActivity("[TNSR-CREATION] Script exit code: {$returnCode} (success)");
+                }
+                return true;
+            } else {
+                logActivity("[TNSR-CREATION] Script exit code: {$returnCode}");
+                if (!empty($output)) {
+                    logActivity("[TNSR-CREATION] Output: " . implode("\n", $output));
+                }
+                return false;
+            }
 
         } catch (\Exception $e) {
+            logActivity("ERROR executing TNSR script: " . $e->getMessage());
             return false;
         }
     }
