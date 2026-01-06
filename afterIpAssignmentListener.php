@@ -3,7 +3,7 @@
 
 namespace App\Custom\EventListeners;
 
-require_once __DIR__ . '/RequestDebugDumper.php';
+//require_once __DIR__ . '/RequestDebugDumper.php';
 use App\Events\publicEvents\serverIpAssignments\afterServerIpAssignments;
 use App\Services\networkDevices\devices\networkSwitches\helpers;
 use App\Services\networkDevices\devices\networkSwitches\switchFacade;
@@ -76,7 +76,7 @@ class afterIpAssignmentListener {
                 // Continue with normal processing if check fails
             }
             
-            debugDumpRequestData('afterIpAssignmentListener', $event->serverId);
+            //debugDumpRequestData('afterIpAssignmentListener', $event->serverId);
             // Skip if no IPs added
             if (!isset($event->addedIps) || empty($event->addedIps)) {
                 logActivity("No IPs added - nothing to process");
